@@ -3,7 +3,6 @@ package p2p
 import (
 	"fmt"
 	"net"
-	"sync"
 )
 
 // TCPPeer represents the remote node over a TCP established connection
@@ -21,25 +20,35 @@ func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer {
 	}
 }
 
+// Close implements the Peer interface.
+func (tp *TCPPeer) Close() error {
+	return tp.conn.Close()
+}
+
 type TCPTransportOpts struct {
 	ListenAddr    string
 	HandshakeFunc HandshakeFunc
 	Decoder       Decoder
+	OnPeer        func(Peer) error
 }
 type TCPTransport struct {
 	TCPTransportOpts
 	listener net.Listener
-
-	mu    sync.RWMutex
-	peers map[net.Addr]Peer
+	rpc_ch   chan RPC
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
 	return &TCPTransport{
 		TCPTransportOpts: opts,
+		rpc_ch:           make(chan RPC),
 	}
 }
 
+// Consume implements the transport interface, which will return a read only
+// channel for reading the incoming messages received from another peer.
+func (t *TCPTransport) Consume() <-chan RPC {
+	return t.rpc_ch
+}
 func (t *TCPTransport) ListenAndAccept() error {
 	var err error
 
@@ -66,25 +75,38 @@ func (t *TCPTransport) startAcceptLoop() {
 
 type Temp struct{}
 
-func (t *TCPTransport) handleConn(conn net.Conn) error {
+func (t *TCPTransport) handleConn(conn net.Conn) {
+	var err error
+	defer func() {
+		fmt.Printf("Dropping peer connection: %s", err)
+		conn.Close()
+	}()
+
 	peer := NewTCPPeer(conn, false)
+
 	if err := t.HandshakeFunc(conn); err != nil {
 		conn.Close()
 		fmt.Printf("TCP handshake error: %s\n", err)
-		return ErrInvalidHandshake
+		return
+	}
+
+	if t.OnPeer != nil {
+		if err = t.OnPeer(peer); err != nil {
+			return
+		}
 	}
 
 	fmt.Printf("new incoming connection %+v\n", peer)
 
-	msg := &Message{}
+	rpc := RPC{}
 	for {
-		if err := t.Decoder.Decode(conn, msg); err != nil {
+		if err := t.Decoder.Decode(conn, &rpc); err != nil {
 			fmt.Printf("TCP error: %s\n", err)
-			continue
+			return
 		}
 
-		msg.From = conn.RemoteAddr()
-		fmt.Printf("message: %+v\n", msg)
+		rpc.From = conn.RemoteAddr()
+		t.rpc_ch <- rpc
 	}
 
 }
